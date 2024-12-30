@@ -1,67 +1,79 @@
-import streamlit as st
-import pandas as pd
-import io
-from datetime import datetime
+import re
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+import feedparser
+import time
 
-def main():
-    st.title("블로그 제목 추출 시스템")
-    
-    # 파일 업로드
-    uploaded_file = st.file_uploader("블로그 데이터 엑셀 파일을 선택하세요", type=['xlsx'])
-    
-    if uploaded_file:
-        try:
-            # 엑셀 파일 읽기
-            df = pd.read_excel(uploaded_file)
-            
-            # 데이터 미리보기
-            st.write("### 데이터 미리보기:")
-            st.write(df.head())
-            
-            if st.button("제목 추출 시작"):
-                # 진행 상황 표시
-                progress_text = st.empty()
-                progress_bar = st.progress(0)
-                
-                try:
-                    # 새로운 데이터프레임 생성
-                    result_df = pd.DataFrame()
-                    
-                    # 필요한 열만 선택
-                    result_df['제목'] = df['제목'].str.strip()
-                    result_df['URL'] = df['URL'].str.strip()
-                    result_df['작성일'] = df['작성일']
-                    
-                    # 날짜 형식 변환
-                    result_df['작성일'] = pd.to_datetime(result_df['작성일']).dt.strftime('%Y-%m-%d')
-                    
-                    # 결과 미리보기
-                    st.write("### 추출 결과 미리보기:")
-                    st.write(result_df.head())
-                    
-                    # 엑셀 파일로 변환
-                    buffer = io.BytesIO()
-                    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                        result_df.to_excel(writer, index=False, sheet_name='블로그제목')
-                    
-                    # 현재 날짜로 파일명 생성
-                    current_date = datetime.now().strftime('%Y%m%d')
-                    
-                    # 결과 파일 다운로드
-                    st.download_button(
-                        label="추출 결과 다운로드",
-                        data=buffer.getvalue(),
-                        file_name=f"블로그제목추출_{current_date}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
-                    
-                    st.success("제목 추출이 완료되었습니다!")
-                    
-                except Exception as e:
-                    st.error(f"제목 추출 중 오류가 발생했습니다: {str(e)}")
-                
-        except Exception as e:
-            st.error(f"파일 읽기 중 오류가 발생했습니다: {str(e)}")
+# 구글 스프레드시트 정보
+spreadsheet_url = "https://docs.google.com/spreadsheets/d/1ufCsVjPm1YJ6FvipTcKDuvGddVWQqJeF_6sahTpO7nk/edit#gid=1320512368"
+spreadsheet_id = re.search(r"/d/(\S+)/edit", spreadsheet_url).group(1)
+original_sheet_name = '업체관리'
+cell_range = 'C6:F'
 
-if __name__ == "__main__":
-    main() 
+# Google Sheets API 인증 설정
+credentials = service_account.Credentials.from_service_account_file('D:/이채윤 파일/코딩/colab-408723-89110ae33a5b.json')
+scoped_credentials = credentials.with_scopes(['https://www.googleapis.com/auth/spreadsheets'])
+service = build('sheets', 'v4', credentials=scoped_credentials)
+
+# 가져올 URL 리스트 가져오기
+url_range = f'{original_sheet_name}!L6:L'
+url_values = service.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=url_range).execute().get('values', [])
+
+# 가져올 업체명 리스트 가져오기
+company_names_range = f'{original_sheet_name}!B6:B'
+company_names_values = service.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=company_names_range).execute().get('values', [])
+
+# 데이터가 있는지 확인 후 처리
+if url_values and company_names_values:
+    for index, (url_data, company_name_data) in enumerate(zip(url_values, company_names_values), 1):
+        # 리스트가 비어 있으면 처리하지 않음
+        if not url_data or not company_name_data:
+            continue
+
+        url = url_data[0]
+        company_name = company_name_data[0]
+
+        # Check if the sheet already exists
+        sheet_names = [sheet['properties']['title'] for sheet in service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()['sheets']]
+        new_sheet_name = company_name
+
+        if new_sheet_name not in sheet_names:
+            # 새로운 시트 생성
+            new_sheet_request = {
+                'requests': [
+                    {
+                        'duplicateSheet': {
+                            'sourceSheetId': service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()['sheets'][0]['properties']['sheetId'],
+                            'insertSheetIndex': 1,
+                            'newSheetName': new_sheet_name
+                        }
+                    }
+                ]
+            }
+            service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=new_sheet_request).execute()
+            print(f"새로운 시트 '{new_sheet_name}'가 생성되었습니다.")
+
+        # RSS 피드 가져오기
+        feed = feedparser.parse(url)
+
+        # RSS 피드 아이템에서 필요한 정보 추출
+        max_items_to_fetch = 50
+        items = feed.get("items", [])[:max_items_to_fetch]
+
+        data = []
+        for item in items:
+            title = item.get("title", "")
+            author = item.get("author", "")
+            link = item.get("link", "")
+            published = item.get("published", "")
+            
+            # 필요한 정보가 없을 경우 빈 문자열로 처리
+            data.append([title, author, link, published])
+
+        # Google Sheets에 값 입력
+        body = {"values": data}
+        service.spreadsheets().values().update(spreadsheetId=spreadsheet_id, range=f'{new_sheet_name}!{cell_range}', body=body, valueInputOption='USER_ENTERED').execute()
+        print(f"새로운 시트 '{new_sheet_name}'에 데이터가 입력되었습니다.")
+
+else:
+    print("No data found.")
